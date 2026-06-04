@@ -110,11 +110,16 @@ def tamper_payload(cmd):
 # ── Core Engine ───────────────────────────────────────────────────────────────
 
 class HunterEngine:
-    def __init__(self, target, types=None, wide_scope=False):
+    def __init__(self, target, types=None, wide_scope=False, scan_only=False, raw=False, cookie=None, user_agent=None, extra_paths=None):
         self.base_target = target
         self.domain = re.sub(r'^https?://', '', target).split('/')[0]
         self.types = types or ["idor", "sqli", "xss", "auth", "rce", "ssrf", "insecure"]
         self.wide_scope = wide_scope
+        self.scan_only = scan_only
+        self.raw = raw
+        self.cookie = cookie
+        self.user_agent = user_agent
+        self.extra_paths = extra_paths or []
         self.targets_to_hunt = [target]
         self.recon_data = {}
         self.findings = []
@@ -166,14 +171,25 @@ class HunterEngine:
 
         # 2. Directory probing (refined)
         paths = ["/api/v1", "/admin", "/.env", "/.git", "/graphql", "/v1/user", "/robots.txt", "/sitemap.xml"]
+        paths.extend(self.extra_paths)
+        
         for p in paths:
             url = f"{target.rstrip('/')}{p}"
-            ua = random.choice(USER_AGENTS)
+            ua = self.user_agent or random.choice(USER_AGENTS)
             time.sleep(random.uniform(0.1, 0.3))
+            
+            # Construct curl command for probing
+            cmd = f"curl -L -o /dev/null -s -w '%{{http_code}}' -m 10 -H 'User-Agent: {ua}' "
+            if self.cookie:
+                cmd += f"-H 'Cookie: {self.cookie}' "
+            cmd += f"'{url}'"
+            
             try:
-                res = subprocess.run(f"curl -L -o /dev/null -s -w '%{{http_code}}' -m 5 -H 'User-Agent: {ua}' {url}", shell=True, capture_output=True, text=True, timeout=10)
-                if res.stdout.strip() in ["200", "403"]:
-                    recon["endpoints"].append({"url": url, "code": res.stdout.strip(), "type": "probe"})
+                res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+                code = res.stdout.strip()
+                if code in ["200", "403", "500", "401"]:
+                    recon["endpoints"].append({"url": url, "code": code, "type": "probe"})
+                    print(f"  [+] Found probe endpoint: {url} (Code: {code})")
             except: pass
             
         recon["params"] = list(set(recon["params"]))
@@ -234,15 +250,29 @@ class HunterEngine:
         if not cmd: return
         print(f"  [~] Testing {h_type}: {test.get('name')}")
         
+        # Extract URL from curl command to verify domain
+        url_match = re.search(r"https?://[^\s\"']+", cmd)
+        cmd_url = url_match.group(0) if url_match else ""
+        
         # Ensure we don't accidentally attack the wrong domain if the AI hallucinated
-        if self.domain not in cmd and "localhost" not in cmd and "127.0.0.1" not in cmd:
-            print(f"    [!] Skipping command on wrong domain: {cmd[:50]}...")
+        # We check the URL specifically, and allow localhost/127.0.0.1 for SSRF tests
+        if self.domain not in cmd_url and "localhost" not in cmd_url and "127.0.0.1" not in cmd_url:
+            print(f"    [!] Skipping command on wrong domain URL: {cmd_url[:50]}...")
             return
 
-        ua = random.choice(USER_AGENTS)
+        ua = self.user_agent or random.choice(USER_AGENTS)
         if " -H " not in cmd: cmd += f" -H 'User-Agent: {ua}'"
         else: cmd = re.sub(r"-H 'User-Agent: [^']*'", f"-H 'User-Agent: {ua}'", cmd)
         
+        # Add Cookie header if provided
+        if self.cookie:
+            if " -H 'Cookie:" not in cmd:
+                cmd += f" -H 'Cookie: {self.cookie}'"
+
+        # Add -i for headers if raw mode is on
+        if self.raw:
+            if " -i" not in cmd: cmd = cmd.replace("curl ", "curl -i ")
+
         time.sleep(random.uniform(0.5, 1.5)) 
         
         cmd_with_code = cmd.replace("curl ", "curl -L -s -w ' HTTP_CODE:%{http_code}' ")
@@ -263,9 +293,19 @@ class HunterEngine:
                 if any(ind in low_out for ind in indicators):
                     is_vuln = True
                 
-            if is_vuln or code == "200":
-                print(f"    [+] Response received. Code: {code}")
-                self.findings.append({"type": h_type, "test": test.get("name"), "curl_command": cmd, "evidence": output[:800], "code": code})
+            if is_vuln or code == "200" or self.scan_only:
+                if is_vuln or code == "200":
+                    print(f"    [+] Response received. Code: {code}")
+                
+                evidence_limit = 50000 if self.raw else 800
+                self.findings.append({
+                    "type": h_type, 
+                    "test": test.get("name"), 
+                    "curl_command": cmd, 
+                    "evidence": output[:evidence_limit], 
+                    "code": code,
+                    "is_potential_vuln": is_vuln
+                })
         except Exception as e:
             print(f"    [!] Execution error: {e}")
 
@@ -359,25 +399,72 @@ class HunterEngine:
         """
         with open(target_dir / f"report_{ts}.html", "w") as f:
             f.write(full_html)
+
+        # 3. Save JSON Session for Resonance (Gemini Analysis)
+        session_data = {
+            "target": self.base_target,
+            "timestamp": ts,
+            "recon_data": self.recon_data,
+            "findings": self.findings,
+            "validated_findings": self.validated_findings,
+            "scan_only": self.scan_only,
+            "raw": self.raw
+        }
+        json_path = SESSIONS_DIR / f"session_{self.domain}_{ts}.json"
+        with open(json_path, "w") as f:
+            json.dump(session_data, f, indent=2)
             
         print(f"[*] Report saved to {target_dir}")
-        print(f"[*] Browser-ready report: {target_dir}/report_{ts}.html")
+        print(f"[*] JSON session saved to {json_path} (Use this for Gemini analysis)")
 
     def run(self):
         if self.wide_scope: self.discover_subdomains()
         for t in self.targets_to_hunt:
             self.run_recon(t)
             for h in self.types: self.launch_hunter(t, h)
-        self.validate_findings()
-        self.generate_final_analysis()
+        
+        if not self.scan_only:
+            self.validate_findings()
+            self.generate_final_analysis()
+        else:
+            print(f"\n[*] Scan complete. Found {len(self.findings)} potential resonance points.")
+            self.final_analysis_text = f"Scan-only mode. {len(self.findings)} findings collected for Gemini analysis."
+            
         self.save_results()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("target")
-    parser.add_argument("--wide", action="store_true")
+    parser.add_argument("target", help="Target URL (e.g., https://example.com)")
+    parser.add_argument("--wide", action="store_true", help="Enable wide-scope discovery (subdomains)")
+    parser.add_argument("--scan-only", action="store_true", help="Skip LLM validation/analysis (faster, saves Ollama tokens)")
+    parser.add_argument("--raw", action="store_true", help="Capture full HTTP responses and headers")
+    parser.add_argument("--types", help="Comma-separated list of hunter types to run (e.g., sqli,xss)")
+    parser.add_argument("--cookie", help="Custom Cookie header to bypass WAF challenges")
+    parser.add_argument("--user-agent", help="Custom User-Agent header for exact browser impersonation")
+    parser.add_argument("--extra-paths", help="Comma-separated list of extra paths to probe (e.g., /admin,/actuator/env)")
+    
     args = parser.parse_args()
+    
+    selected_types = None
+    if args.types:
+        selected_types = [t.strip().lower() for t in args.types.split(",")]
+
+    extra_paths_list = []
+    if args.extra_paths:
+        extra_paths_list = [p.strip() for p in args.extra_paths.split(",")]
+
     print("\n╔══════════════════════════════════════════╗")
     print("║     Kitsune-Grimoire — Stealth Hunter    ║")
     print("╚══════════════════════════════════════════╝\n")
-    HunterEngine(args.target, wide_scope=args.wide).run()
+    
+    engine = HunterEngine(
+        args.target, 
+        types=selected_types, 
+        wide_scope=args.wide, 
+        scan_only=args.scan_only, 
+        raw=args.raw,
+        cookie=args.cookie,
+        user_agent=args.user_agent,
+        extra_paths=extra_paths_list
+    )
+    engine.run()

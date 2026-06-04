@@ -62,9 +62,24 @@ sudo apt install subfinder  # Or go install -v github.com/projectdiscovery/subfi
 
 ---
 
-## 🕵️ How to Hunt
+## 🧬 Hybrid "Resonance" Mode (Gemini + Ollama)
 
-The local engine is powered by `hunt.py`. It automates the **Recon -> Hunt -> Validate** lifecycle.
+Maximize token efficiency by delegating raw scanning to Ollama and expert analysis to Gemini CLI.
+
+### 1. Perform a "Resonance Scan" with Ollama
+Use Ollama to perform the high-volume, token-intensive scanning. The `--raw` flag ensures full response headers and bodies are captured for later analysis.
+
+```bash
+python3 hunt.py https://target.com --scan-only --raw
+```
+
+### 2. Expert Analysis with Gemini CLI
+Once the scan is complete, Gemini CLI can read the session JSON and provide a high-fidelity "Resonance Report" with WAF bypass techniques and exploit chains.
+
+**Benefits:**
+- **Zero Token Cost** for the initial 100+ requests.
+- **Deep Analysis**: Gemini uses its 2M context window to look for patterns Ollama 7b might miss.
+- **Headers Analysis**: Captured headers allow for finding subtle cache poisoning or security misconfigurations.
 
 ### 1. The "All-In" Hunt
 Launch all 18 specialized hunters simultaneously on a target:
